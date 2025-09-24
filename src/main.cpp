@@ -1,6 +1,8 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <quirc.h>
+#include <WebServer.h>
+#include "esp_http_server.h"
 
 // WiFi credentials - Connect to existing network
 const char* ssid = "Huhu";
@@ -26,6 +28,99 @@ const char* password = "hahahahaa";
 
 // LED pin
 #define LED_PIN 2
+
+// Streaming server
+WebServer server(80);
+httpd_handle_t stream_httpd = NULL;
+volatile bool isStreaming = false;
+
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+static const char* INDEX_HTML =
+"<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><title>ESP32-CAM</title></head>"
+"<body style='font-family:Arial;text-align:center'>"
+"<h2>ESP32-CAM Stream</h2>"
+"<img id='stream' style='width:100%;max-width:640px;border:1px solid #ccc'/>"
+"<script>document.getElementById('stream').src='http://'+location.hostname+':81/stream';</script>"
+"</body></html>";
+
+static esp_err_t stream_handler(httpd_req_t *req) {
+  isStreaming = true;
+  camera_fb_t *fb = NULL;
+  esp_err_t res = ESP_OK;
+  size_t jpg_buf_len = 0;
+  uint8_t *jpg_buf = NULL;
+  char part_buf[64];
+
+  res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) { isStreaming = false; return res; }
+
+  while (true) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      res = ESP_FAIL;
+    } else {
+      if (fb->format != PIXFORMAT_JPEG) {
+        bool jpeg_converted = frame2jpg(fb, 60, &jpg_buf, &jpg_buf_len);
+        esp_camera_fb_return(fb);
+        fb = NULL;
+        if (!jpeg_converted) {
+          res = ESP_FAIL;
+        }
+      } else {
+        jpg_buf = fb->buf;
+        jpg_buf_len = fb->len;
+      }
+    }
+
+    if (res == ESP_OK) {
+      int hlen = snprintf(part_buf, sizeof(part_buf), _STREAM_PART, (unsigned int)jpg_buf_len);
+      res = httpd_resp_send_chunk(req, part_buf, hlen);
+    }
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, (const char *)jpg_buf, jpg_buf_len);
+    }
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+    }
+
+    if (fb) {
+      esp_camera_fb_return(fb);
+      fb = NULL;
+      jpg_buf = NULL;
+    } else if (jpg_buf) {
+      free(jpg_buf);
+      jpg_buf = NULL;
+    }
+
+    if (res != ESP_OK) {
+      break;
+    }
+
+    vTaskDelay(1);
+  }
+  isStreaming = false;
+  return res;
+}
+
+static void startCameraServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 81;
+
+  httpd_uri_t stream_uri = {
+    .uri       = "/stream",
+    .method    = HTTP_GET,
+    .handler   = stream_handler,
+    .user_ctx  = NULL
+  };
+
+  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &stream_uri);
+  }
+}
 
 // QR code detection variables
 struct quirc *q = NULL;
@@ -100,8 +195,8 @@ void setup() {
   config.pixel_format = PIXFORMAT_GRAYSCALE; // keep grayscale for QR; stream converts to JPEG
   config.frame_size = FRAMESIZE_QVGA; // 320x240 to enlarge QR in frame
   config.jpeg_quality = 12;
-  config.fb_count = 2; // double buffer for smoother streaming
-  config.grab_mode = CAMERA_GRAB_LATEST; // reduce blocking
+  config.fb_count = 2;                // double buffering to reduce blocking
+  config.grab_mode = CAMERA_GRAB_LATEST; // drop old frames, get latest
   
   // Initialize camera
   esp_err_t err = esp_camera_init(&config);
@@ -144,9 +239,26 @@ void setup() {
   
   Serial.println("QR Code Scanner Ready!");
   Serial.println("Scanning every 3 seconds...");
+
+  // HTTP server for index and redirect to stream
+  server.on("/", [](){ server.send(200, "text/html", INDEX_HTML); });
+  server.on("/stream", [](){
+    String url = String("http://") + WiFi.localIP().toString() + ":81/stream";
+    server.sendHeader("Location", url, true);
+    server.send(302, "text/plain", "");
+  });
+  server.begin();
+  startCameraServer();
 }
 
 void loop() {
+  // If streaming, pause QR scanning to avoid contention
+  if (isStreaming) {
+    server.handleClient();
+    delay(10);
+    return;
+  }
+  
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("Camera capture failed");
@@ -161,23 +273,15 @@ void loop() {
     lastDebug = millis();
   }
   
-  // Ensure quirc buffer matches frame size and copy raw grayscale
+  // Copy raw grayscale into quirc buffer (fixed size 320x240)
   int qw = 0, qh = 0;
-  if (fb->width != 0 && fb->height != 0) {
-    if (quirc_resize(q, fb->width, fb->height) < 0) {
-      Serial.println("Failed to resize quirc to frame size");
-      esp_camera_fb_return(fb);
-      return;
-    }
-  }
   uint8_t *image = quirc_begin(q, &qw, &qh);
   if (!image) {
     Serial.println("Failed to get image buffer");
     esp_camera_fb_return(fb);
     return;
   }
-  size_t copy_len = (size_t)qw * (size_t)qh;
-  if (fb->len < copy_len) copy_len = fb->len; // safety
+  size_t copy_len = (size_t)qw * (size_t)qh; // expect 320*240
   memcpy(image, fb->buf, copy_len);
   
   // Process the image
@@ -220,10 +324,53 @@ void loop() {
         qrDecoded = true;
         break;
       } else {
-        Serial.printf("❌ Decode failed: %s\n", quirc_strerror(err));
+        // minimize spam: only print decode errors occasionally
+        static unsigned long lastErr = 0;
+        if (millis() - lastErr > 2000) {
+          Serial.printf("❌ Decode failed: %s\n", quirc_strerror(err));
+          lastErr = millis();
+        }
       }
       
       if (qrDecoded) break;
+    }
+
+    // Second pass: adaptive threshold for dotted/low-contrast QR
+    if (!qrDecoded) {
+      int qw2 = 0, qh2 = 0;
+      uint8_t *th_img = quirc_begin(q, &qw2, &qh2);
+      if (th_img && qw2 > 0 && qh2 > 0) {
+        size_t n = (size_t)qw2 * (size_t)qh2;
+        // Compute fast approximate mean (stride 4)
+        uint32_t sum = 0; size_t cnt = 0;
+        for (size_t k = 0; k < n; k += 4) { sum += ((uint8_t*)fb->buf)[k]; cnt++; }
+        uint8_t thr = cnt ? (uint8_t)(sum / cnt) : 128;
+        // Slightly raise threshold to suppress gray dots
+        if (thr < 110) thr = 110; if (thr > 160) thr = 160;
+        // Write thresholded image to quirc buffer
+        for (size_t k = 0; k < n; k++) {
+          uint8_t px = ((uint8_t*)fb->buf)[k];
+          th_img[k] = (px > thr) ? 255 : 0;
+        }
+        quirc_end(q);
+
+        int num2 = quirc_count(q);
+        if (num2 > 0) {
+          for (int i = 0; i < num2; i++) {
+            quirc_extract(q, i, &code);
+            if (quirc_decode(&code, &data) == QUIRC_SUCCESS) {
+              totalQRDecoded++;
+              Serial.printf("✅ (TH) QR: %s (Success: %d/%d)\n", (char*)data.payload, totalQRDecoded, totalQRDetected);
+              // Blink confirmation
+              for (int b = 0; b < 2; b++) { digitalWrite(LED_PIN, HIGH); delay(100); digitalWrite(LED_PIN, LOW); delay(100); }
+              qrDecoded = true;
+              break;
+            }
+          }
+        }
+      } else {
+        quirc_end(q);
+      }
     }
     
     // Blink LED 2 times when QR is detected
@@ -236,11 +383,17 @@ void loop() {
       }
     }
   } else {
-    Serial.println("No QR code found");
+    static unsigned long lastNo = 0;
+    if (millis() - lastNo > 2000) {
+      Serial.println("No QR code found");
+      lastNo = millis();
+    }
   }
   
   // Return camera frame buffer
   esp_camera_fb_return(fb);
+  
+  server.handleClient();
   
   // Check WiFi status
   if (WiFi.status() != WL_CONNECTED) {
@@ -251,5 +404,5 @@ void loop() {
     digitalWrite(LED_PIN, LOW);  // LED off when connected
   }
   
-  delay(1000); // Scan every 1 second
+  delay(100); // faster scan interval
 }
