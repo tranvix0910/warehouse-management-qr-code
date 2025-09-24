@@ -1,0 +1,30 @@
+{
+  "name": "quirc",
+  "version": "1.0.0",
+  "description": "QR-code recognition library for ESP32",
+  "keywords": ["qr", "qr-code", "recognition", "decoder"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dlbeer/quirc.git"
+  },
+  "authors": [
+    {
+      "name": "Daniel Beer",
+      "email": "dlbeer@gmail.com"
+    }
+  ],
+  "license": "MIT",
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"],
+  "build": {
+    "srcFilter": [
+      "+<*.c>",
+      "-<test/*>",
+      "-<examples/*>"
+    ],
+    "includeDir": "include"
+  },
+  "dependencies": {
+    "adafruit/Adafruit Unified Sensor": "^1.1.9"
+  }
+}
